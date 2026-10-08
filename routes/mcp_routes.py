@@ -12,7 +12,7 @@ import httpx
 
 from core.database import McpServer, SessionLocal
 from core.middleware import require_admin
-from src.mcp_manager import McpManager
+from src.mcp_manager import McpManager, REMOTE_TRANSPORTS
 
 logger = logging.getLogger(__name__)
 
@@ -99,8 +99,10 @@ def setup_mcp_routes(mcp_manager: McpManager):
         # Validate
         if transport == "stdio" and not command:
             raise HTTPException(400, "command is required for stdio transport")
-        if transport == "sse" and not url:
-            raise HTTPException(400, "url is required for SSE transport")
+        if transport not in ("stdio", *REMOTE_TRANSPORTS):
+            raise HTTPException(400, f"unknown transport: {transport}")
+        if transport in REMOTE_TRANSPORTS and not url:
+            raise HTTPException(400, f"url is required for {transport} transport")
 
         # Parse JSON fields
         try:

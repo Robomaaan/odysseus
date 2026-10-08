@@ -33,7 +33,8 @@ python-dateutil
 caldav
 cryptography
 bcrypt
-mcp
+# mcp 2.x renamed/removed the server APIs used by mcp_servers/*.py.
+mcp>=1.10,<2
 pyotp
 qrcode[pil]
 croniter

@@ -622,6 +622,25 @@ set_task_scheduler(task_scheduler)
 from routes.task_routes import setup_task_routes
 app.include_router(setup_task_routes(task_scheduler))
 
+# Paperclip HTTP-adapter heartbeats → headless agent runs (src/paperclip_bridge.py).
+from src.constants import DATA_DIR
+from src.paperclip_bridge import PaperclipBridge, setup_paperclip_routes
+
+
+async def _paperclip_notify(text: str):
+    if os.environ.get("PAPERCLIP_NOTIFY_TELEGRAM", "").strip().lower() not in ("1", "true", "yes", "on"):
+        return
+    _tg = getattr(app.state, "telegram_bridge", None)
+    if _tg:
+        await _tg.broadcast(text)
+
+
+app.include_router(setup_paperclip_routes(PaperclipBridge(
+    session_manager,
+    state_path=os.path.join(DATA_DIR, "paperclip_state.json"),
+    notify=_paperclip_notify,
+)))
+
 from routes.assistant_routes import setup_assistant_routes
 app.include_router(setup_assistant_routes(task_scheduler))
 
@@ -859,6 +878,11 @@ async def _startup_event():
     # the web server is accepting traffic instead of delaying the whole UI.
     async def _startup_mcp_connections():
         try:
+            from src.mcp_config_seed import seed_from_env
+            seed_from_env()
+        except Exception as e:
+            logger.error(f"MCP config seed failed: {type(e).__name__}: {e}")
+        try:
             from src.builtin_mcp import register_builtin_servers
             await register_builtin_servers(mcp_manager)
         except BaseException as e:
@@ -871,6 +895,16 @@ async def _startup_event():
             logger.warning(f"MCP startup failed (non-critical): {type(e).__name__}: {e}")
 
     _startup_tasks.append(asyncio.create_task(_startup_mcp_connections()))
+
+    # Telegram bridge (off unless TELEGRAM_BOT_TOKEN + TELEGRAM_ALLOWED_USERS are set).
+    try:
+        from src.telegram_bridge import TelegramBridge
+        _tg = TelegramBridge.from_env(session_manager)
+        if _tg:
+            app.state.telegram_bridge = _tg
+            _startup_tasks.append(asyncio.create_task(_tg.run()))
+    except Exception as e:
+        logger.error(f"Telegram bridge failed to start: {type(e).__name__}: {e}")
 
     # Pre-warm the RAG tool index off the request path. Loading the local
     # embedding model + opening ChromaDB + indexing the built-in tools is a
@@ -1063,6 +1097,12 @@ async def _shutdown_event():
         await webhook_manager.close()
     except Exception as e:
         logger.warning(f"Webhook manager shutdown error: {e}")
+    _tg = getattr(app.state, "telegram_bridge", None)
+    if _tg:
+        try:
+            await _tg.stop()
+        except Exception as e:
+            logger.warning(f"Telegram bridge shutdown error: {e}")
     # Disconnect all MCP servers
     try:
         await mcp_manager.disconnect_all()

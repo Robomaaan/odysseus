@@ -107,6 +107,13 @@ def _tool_path_roots() -> list[str]:
     except Exception:
         pass
 
+    # Configured project workspaces (ODYSSEUS_PROJECTS).
+    try:
+        from src.workspaces import project_roots
+        roots.extend(project_roots())
+    except Exception:
+        pass
+
     # Deduplicate; resolve symlinks so containment is unambiguous.
     seen: set[str] = set()
     out: list[str] = []
@@ -136,7 +143,8 @@ def _resolve_tool_path(raw_path: str) -> str:
     """
     if raw_path is None or not str(raw_path).strip():
         raise ValueError("path is required")
-    expanded = os.path.expanduser(str(raw_path).strip())
+    from src.workspaces import resolve_relative
+    expanded = os.path.expanduser(resolve_relative(str(raw_path).strip()))
     resolved = os.path.realpath(expanded)
 
     if _is_sensitive_path(resolved):
@@ -462,6 +470,10 @@ async def _direct_fallback(
         "COLUMNS": "120",
         "LINES": "40",
     }
+    # Project runs (e.g. Telegram /projekt) pin the shell to the repo.
+    from src.workspaces import ACTIVE_WORKDIR, EXTRA_ENV
+    _cwd = ACTIVE_WORKDIR.get()
+    _subproc_env.update(EXTRA_ENV.get())
 
     try:
         if tool == "bash":
@@ -470,6 +482,7 @@ async def _direct_fallback(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=_subproc_env,
+                cwd=_cwd,
             )
             stdout, stderr, rc, timed_out = await _run_subprocess_streaming(
                 proc,
@@ -496,6 +509,7 @@ async def _direct_fallback(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=_subproc_env,
+                cwd=_cwd,
             )
             stdout, stderr, rc, timed_out = await _run_subprocess_streaming(
                 proc,

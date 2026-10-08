@@ -5,12 +5,38 @@ Manages connections to MCP (Model Context Protocol) tool servers.
 Each server exposes tools that are made available to the agent loop.
 """
 
+import asyncio
 import json
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# Remote transports ("sse", "http") reuse the server's `env` column as HTTP
+# headers. Values may reference process env vars as ${NAME} so bearer tokens
+# stay in the environment instead of the database.
+REMOTE_TRANSPORTS = ("sse", "http")
+REMOTE_CONNECT_TIMEOUT = 20
+_ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def expand_header_values(headers: Optional[Dict[str, str]]) -> Dict[str, str]:
+    """Resolve ${NAME} references in header values from os.environ.
+
+    Raises ValueError naming the missing variable instead of silently sending
+    an empty or literal "${NAME}" credential.
+    """
+    resolved: Dict[str, str] = {}
+    for key, value in (headers or {}).items():
+        def _sub(match):
+            name = match.group(1)
+            if name not in os.environ:
+                raise ValueError(f"Header {key!r} references unset environment variable {name}")
+            return os.environ[name]
+        resolved[str(key)] = _ENV_REF.sub(_sub, str(value))
+    return resolved
 
 def _format_mcp_connection_error(name: str, command: str = "", args: Optional[List[str]] = None, error: Exception = None) -> str:
     """Return a user-actionable MCP connection error message."""
@@ -29,6 +55,42 @@ def _format_mcp_connection_error(name: str, command: str = "", args: Optional[Li
 
     return raw_error
 
+
+
+class _RemoteHandle:
+    """Stands in for an AsyncExitStack: closing signals the connection's worker task."""
+
+    def __init__(self, stop, worker):
+        self._stop = stop
+        self._worker = worker
+
+    async def aclose(self):
+        self._stop.set()
+        try:
+            await asyncio.wait_for(self._worker, timeout=5)
+        except BaseException:
+            self._worker.cancel()
+
+
+def _unwrap_connect_error(exc: BaseException) -> Exception:
+    """Surface the real cause (e.g. HTTP 401) from anyio task-group wrappers."""
+    seen = 0
+    while seen < 10:
+        seen += 1
+        inner = getattr(exc, "exceptions", None)
+        if inner:
+            # Prefer a non-cancellation leaf (the HTTP error) over CancelledError.
+            picks = [e for e in inner if not isinstance(e, asyncio.CancelledError)]
+            exc = (picks or list(inner))[0]
+            continue
+        cause = exc.__cause__ or exc.__context__
+        if isinstance(exc, (asyncio.CancelledError, RuntimeError)) and cause is not None:
+            exc = cause
+            continue
+        break
+    if isinstance(exc, Exception):
+        return exc
+    return RuntimeError(f"connection aborted ({type(exc).__name__})")
 
 
 class McpManager:
@@ -56,12 +118,12 @@ class McpManager:
         env: Optional[Dict[str, str]] = None,
         url: Optional[str] = None,
     ) -> bool:
-        """Connect to an MCP server via stdio or SSE transport."""
+        """Connect to an MCP server via stdio, SSE or Streamable HTTP transport."""
         try:
             if transport == "stdio":
                 res = await self._connect_stdio(server_id, name, command, args or [], env or {})
-            elif transport == "sse":
-                res = await self._connect_sse(server_id, name, url)
+            elif transport in REMOTE_TRANSPORTS:
+                res = await self._connect_remote(server_id, name, url, transport, expand_header_values(env))
             else:
                 logger.error(f"Unknown MCP transport: {transport}")
                 res = False
@@ -138,51 +200,96 @@ class McpManager:
             self._connections[server_id] = {"status": "error", "error": "mcp package not installed", "name": name}
             return False
 
-    async def _connect_sse(self, server_id: str, name: str, url: str) -> bool:
-        """Connect to an MCP server via SSE transport."""
+    async def _connect_remote(self, server_id: str, name: str, url: str, transport_name: str,
+                              headers: Dict[str, str]) -> bool:
+        """Connect to a remote MCP server via SSE or Streamable HTTP transport.
+
+        The mcp client context managers use anyio task groups that must be
+        entered and exited in the same task; a failed handshake (e.g. HTTP 401)
+        otherwise surfaces as CancelledError / "exit cancel scope in a different
+        task" and escapes connect_server. A dedicated worker task owns the
+        connection for its whole lifetime and reports the outcome via a future.
+        """
         try:
-            from mcp import ClientSession
-            from mcp.client.sse import sse_client
-            from contextlib import AsyncExitStack
-
-            stack = AsyncExitStack()
-            try:
-                transport = await stack.enter_async_context(sse_client(url))
-                read_stream, write_stream = transport
-                session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
-
-                await session.initialize()
-
-                # Discover tools
-                tools_result = await session.list_tools()
-            except Exception:
-                await stack.aclose()
-                raise
-            tools = []
-            for tool in tools_result.tools:
-                tools.append({
-                    "name": tool.name,
-                    "description": tool.description or "",
-                    "input_schema": tool.inputSchema if hasattr(tool, 'inputSchema') else {},
-                })
-
-            self._sessions[server_id] = session
-            self._stacks[server_id] = stack
-            self._tools[server_id] = tools
-            self._connections[server_id] = {
-                "status": "connected",
-                "name": name,
-                "transport": "sse",
-                "tool_count": len(tools),
-            }
-
-            logger.info(f"MCP server connected: {name} ({server_id}) - {len(tools)} tools via SSE")
-            return True
-
+            from mcp import ClientSession  # noqa: F401  (fail fast if missing)
         except ImportError:
             logger.warning("MCP package not installed. Install with: pip install mcp")
             self._connections[server_id] = {"status": "error", "error": "mcp package not installed", "name": name}
             return False
+
+        loop = asyncio.get_running_loop()
+        ready: asyncio.Future = loop.create_future()
+        stop = asyncio.Event()
+        worker = asyncio.create_task(
+            self._remote_worker(url, transport_name, headers, ready, stop),
+            name=f"mcp-remote-{server_id}",
+        )
+        try:
+            session, tools, label = await asyncio.wait_for(asyncio.shield(ready), timeout=REMOTE_CONNECT_TIMEOUT)
+        except BaseException as e:
+            stop.set()
+            if not ready.done():
+                worker.cancel()
+            try:
+                await asyncio.wait_for(worker, timeout=5)
+            except BaseException:
+                pass
+            if isinstance(e, asyncio.TimeoutError):
+                raise RuntimeError(f"timed out after {REMOTE_CONNECT_TIMEOUT}s connecting to {url}") from None
+            if isinstance(e, asyncio.CancelledError) and not ready.done():
+                raise  # we ourselves were cancelled
+            raise
+
+        self._sessions[server_id] = session
+        self._stacks[server_id] = _RemoteHandle(stop, worker)
+        self._tools[server_id] = tools
+        self._connections[server_id] = {
+            "status": "connected",
+            "name": name,
+            "transport": transport_name,
+            "tool_count": len(tools),
+        }
+        logger.info(f"MCP server connected: {name} ({server_id}) - {len(tools)} tools via {label}")
+        return True
+
+    @staticmethod
+    async def _remote_worker(url: str, transport_name: str, headers: Dict[str, str],
+                             ready: "asyncio.Future", stop: "asyncio.Event"):
+        from mcp import ClientSession
+        from contextlib import AsyncExitStack
+        try:
+            async with AsyncExitStack() as stack:
+                if transport_name == "http":
+                    import mcp.client.streamable_http as _sh
+                    if hasattr(_sh, "streamable_http_client"):
+                        # mcp >= 2: headers live on the httpx client we pass in.
+                        http_client = await stack.enter_async_context(
+                            _sh.create_mcp_http_client(headers=headers or None))
+                        client = _sh.streamable_http_client(url, http_client=http_client)
+                    else:
+                        client = _sh.streamablehttp_client(url, headers=headers or None)
+                    label = "Streamable HTTP"
+                else:
+                    from mcp.client.sse import sse_client
+                    client = sse_client(url, headers=headers or None)
+                    label = "SSE"
+                transport = await stack.enter_async_context(client)
+                # streamablehttp_client yields (read, write, get_session_id)
+                session = await stack.enter_async_context(ClientSession(transport[0], transport[1]))
+                await session.initialize()
+                tools_result = await session.list_tools()
+                tools = [{
+                    "name": tool.name,
+                    "description": tool.description or "",
+                    "input_schema": tool.inputSchema if hasattr(tool, 'inputSchema') else {},
+                } for tool in tools_result.tools]
+                ready.set_result((session, tools, label))
+                await stop.wait()
+        except BaseException as e:
+            if not ready.done():
+                ready.set_exception(_unwrap_connect_error(e))
+            elif not isinstance(e, asyncio.CancelledError):
+                logger.warning(f"MCP remote connection to {url} ended: {type(e).__name__}: {e}")
 
     async def disconnect_server(self, server_id: str):
         """Disconnect from an MCP server."""

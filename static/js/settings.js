@@ -4257,7 +4257,7 @@ async function initUnifiedIntegrations() {
           <h2 style="font-size:13px">Add MCP Server</h2>
           <div class="settings-col">
             <div class="settings-row"><label class="settings-label">Name</label><input id="uf-mcp-name" class="settings-input" placeholder="Server name"></div>
-            <div class="settings-row"><label class="settings-label">Transport</label><select id="uf-mcp-transport" class="settings-input"><option value="stdio">stdio</option><option value="sse">SSE</option></select></div>
+            <div class="settings-row"><label class="settings-label">Transport</label><select id="uf-mcp-transport" class="settings-input"><option value="stdio">stdio</option><option value="sse">SSE</option><option value="http">Streamable HTTP</option></select></div>
             <div id="uf-mcp-stdio-fields" style="display:flex;flex-direction:column;gap:6px;">
               <div class="settings-row"><label class="settings-label">Command</label><input id="uf-mcp-cmd" class="settings-input" placeholder="npx"></div>
               <div class="settings-row"><label class="settings-label">Args</label><input id="uf-mcp-args" class="settings-input" placeholder='["-y", "@modelcontextprotocol/server-filesystem"]'></div>
@@ -4265,12 +4265,13 @@ async function initUnifiedIntegrations() {
             </div>
             <div id="uf-mcp-sse-fields" style="display:none;flex-direction:column;gap:6px;">
               <div class="settings-row"><label class="settings-label">URL</label><input id="uf-mcp-url" class="settings-input" placeholder="http://localhost:3001/sse"></div>
+              <div class="settings-row"><label class="settings-label">Headers</label><input id="uf-mcp-headers" class="settings-input" placeholder='{"Authorization": "Bearer \${MY_TOKEN}"}'></div>
             </div>
             <div class="settings-row" style="margin-top:4px"><button class="admin-btn-sm" id="uf-mcp-save">Save</button><button class="admin-btn-sm" id="uf-mcp-cancel" style="opacity:0.7">Cancel</button><span id="uf-mcp-msg" style="font-size:11px"></span></div>
           </div>
         </div>`;
       el('uf-mcp-transport').addEventListener('change', () => {
-        const sse = el('uf-mcp-transport').value === 'sse';
+        const sse = el('uf-mcp-transport').value !== 'stdio';
         el('uf-mcp-stdio-fields').style.display = sse ? 'none' : 'flex';
         el('uf-mcp-sse-fields').style.display = sse ? 'flex' : 'none';
       });
@@ -4288,7 +4289,10 @@ async function initUnifiedIntegrations() {
           fd.append('args', args);
           fd.append('env', env);
         } else {
+          // Remote transports store headers in the env column; ${VAR} is resolved server-side.
+          let headers = '{}'; try { headers = JSON.stringify(JSON.parse(el('uf-mcp-headers').value || '{}')); } catch (_) {}
           fd.append('url', el('uf-mcp-url').value);
+          fd.append('env', headers);
         }
         try {
           const r = await fetch('/api/mcp/servers', { method: 'POST', credentials: 'same-origin', body: fd });
